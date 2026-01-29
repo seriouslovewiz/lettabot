@@ -1,0 +1,93 @@
+/**
+ * LettaBot Configuration Types
+ * 
+ * Two modes:
+ * 1. Self-hosted: Uses baseUrl (e.g., http://localhost:8283), no API key
+ * 2. Letta Cloud: Uses apiKey, optional BYOK providers
+ */
+
+export interface LettaBotConfig {
+  // Server connection
+  server: {
+    // 'cloud' (api.letta.com) or 'selfhosted'
+    mode: 'cloud' | 'selfhosted';
+    // Only for selfhosted mode
+    baseUrl?: string;
+    // Only for cloud mode
+    apiKey?: string;
+  };
+
+  // Agent configuration
+  agent: {
+    id?: string;
+    name: string;
+    model: string;
+  };
+
+  // BYOK providers (cloud mode only)
+  providers?: ProviderConfig[];
+
+  // Channel configurations
+  channels: {
+    telegram?: TelegramConfig;
+    slack?: SlackConfig;
+    whatsapp?: WhatsAppConfig;
+    signal?: SignalConfig;
+  };
+
+  // Features
+  features?: {
+    cron?: boolean;
+    heartbeat?: {
+      enabled: boolean;
+      intervalMin?: number;
+    };
+  };
+}
+
+export interface ProviderConfig {
+  id: string;           // e.g., 'anthropic', 'openai'
+  name: string;         // e.g., 'lc-anthropic'
+  type: string;         // e.g., 'anthropic', 'openai'
+  apiKey: string;
+}
+
+export interface TelegramConfig {
+  enabled: boolean;
+  token?: string;
+  dmPolicy?: 'pairing' | 'allowlist' | 'open';
+  allowedUsers?: string[];
+}
+
+export interface SlackConfig {
+  enabled: boolean;
+  appToken?: string;
+  botToken?: string;
+  allowedUsers?: string[];
+}
+
+export interface WhatsAppConfig {
+  enabled: boolean;
+  selfChat?: boolean;
+  dmPolicy?: 'pairing' | 'allowlist' | 'open';
+  allowedUsers?: string[];
+}
+
+export interface SignalConfig {
+  enabled: boolean;
+  phone?: string;
+  dmPolicy?: 'pairing' | 'allowlist' | 'open';
+  allowedUsers?: string[];
+}
+
+// Default config
+export const DEFAULT_CONFIG: LettaBotConfig = {
+  server: {
+    mode: 'cloud',
+  },
+  agent: {
+    name: 'LettaBot',
+    model: 'zai/glm-4.7', // Free model default
+  },
+  channels: {},
+};

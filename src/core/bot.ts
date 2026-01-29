@@ -190,19 +190,64 @@ export class LettaBot {
       console.log(`[Bot] Session _agentId:`, (session as any)._agentId);
       console.log(`[Bot] Session options.permissionMode:`, (session as any).options?.permissionMode);
       
-      // Hook into transport errors
+      // Hook into transport errors and stdout
       const transport = (session as any).transport;
       if (transport?.process) {
+        console.log('[Bot] Transport process PID:', transport.process.pid);
+        transport.process.stdout?.on('data', (data: Buffer) => {
+          console.log('[Bot] CLI stdout:', data.toString().slice(0, 500));
+        });
         transport.process.stderr?.on('data', (data: Buffer) => {
           console.error('[Bot] CLI stderr:', data.toString());
         });
+        transport.process.on('exit', (code: number) => {
+          console.log('[Bot] CLI process exited with code:', code);
+        });
+        transport.process.on('error', (err: Error) => {
+          console.error('[Bot] CLI process error:', err);
+        });
+      } else {
+        console.log('[Bot] No transport process found');
       }
       
+      // Initialize session explicitly (so we can log timing/failures)
+      console.log('[Bot] About to initialize session...');
+      console.log('[Bot] LETTA_API_KEY in env:', process.env.LETTA_API_KEY ? `${process.env.LETTA_API_KEY.slice(0, 30)}...` : 'NOT SET');
+      console.log('[Bot] LETTA_CLI_PATH:', process.env.LETTA_CLI_PATH || 'not set (will use default)');
+      
+      const initTimeoutMs = 30000; // Increased to 30s
+      const withTimeout = async <T>(promise: Promise<T>, label: string): Promise<T> => {
+        let timeoutId: NodeJS.Timeout;
+        const timeoutPromise = new Promise<T>((_, reject) => {
+          timeoutId = setTimeout(() => {
+            reject(new Error(`${label} timed out after ${initTimeoutMs}ms`));
+          }, initTimeoutMs);
+        });
+        try {
+          return await Promise.race([promise, timeoutPromise]);
+        } finally {
+          clearTimeout(timeoutId!);
+        }
+      };
+
+      console.log('[Bot] Initializing session...');
+      const initInfo = await withTimeout(session.initialize(), 'Session initialize');
+      console.log('[Bot] Session initialized:', initInfo);
+
       // Send message to agent with metadata envelope
       const formattedMessage = formatMessageEnvelope(msg);
-      console.log('[Bot] Sending message...');
-      await session.send(formattedMessage);
-      console.log('[Bot] Message sent, starting stream...');
+      console.log('[Bot] Formatted message:', formattedMessage.slice(0, 200));
+      console.log('[Bot] Target server:', process.env.LETTA_BASE_URL || 'https://api.letta.com (default)');
+      console.log('[Bot] API key:', process.env.LETTA_API_KEY ? `${process.env.LETTA_API_KEY.slice(0, 20)}...` : '(not set)');
+      console.log('[Bot] Agent ID:', this.store.agentId || '(new agent)');
+      console.log('[Bot] Sending message to session...');
+      try {
+        await withTimeout(session.send(formattedMessage), 'Session send');
+        console.log('[Bot] Message sent successfully, starting stream...');
+      } catch (sendError) {
+        console.error('[Bot] Error in session.send():', sendError);
+        throw sendError;
+      }
       
       // Stream response
       let response = '';
@@ -214,8 +259,12 @@ export class LettaBot {
         adapter.sendTypingIndicator(msg.chatId).catch(() => {});
       }, 4000);
       
+      let streamCount = 0;
       try {
+        console.log('[Bot] Entering stream loop...');
         for await (const streamMsg of session.stream()) {
+          streamCount++;
+          console.log(`[Bot] Stream msg #${streamCount}: type=${streamMsg.type}, content=${streamMsg.type === 'assistant' ? streamMsg.content?.slice(0, 50) + '...' : '(n/a)'}`);
           if (streamMsg.type === 'assistant') {
             response += streamMsg.content;
             
@@ -260,32 +309,44 @@ export class LettaBot {
         clearInterval(typingInterval);
       }
       
+      console.log(`[Bot] Stream complete. Total messages: ${streamCount}, Response length: ${response.length}`);
+      console.log(`[Bot] Response preview: ${response.slice(0, 100)}...`);
+      
       // Send final response
       if (response) {
+        console.log(`[Bot] Sending final response (messageId=${messageId})`);
         try {
           if (messageId) {
             await adapter.editMessage(msg.chatId, messageId, response);
+            console.log('[Bot] Edited existing message');
           } else {
             await adapter.sendMessage({ chatId: msg.chatId, text: response, threadId: msg.threadId });
+            console.log('[Bot] Sent new message');
           }
-        } catch {
+        } catch (sendError) {
+          console.error('[Bot] Error sending final message:', sendError);
           // If we already sent a streamed message, don't duplicate — the user already saw it.
           if (!messageId) {
             await adapter.sendMessage({ chatId: msg.chatId, text: response, threadId: msg.threadId });
           }
         }
       } else {
+        console.log('[Bot] No response from agent, sending placeholder');
         await adapter.sendMessage({ chatId: msg.chatId, text: '(No response from agent)', threadId: msg.threadId });
       }
       
     } catch (error) {
-      console.error('Error processing message:', error);
+      console.error('[Bot] Error processing message:', error);
+      if (error instanceof Error) {
+        console.error('[Bot] Error stack:', error.stack);
+      }
       await adapter.sendMessage({
         chatId: msg.chatId,
         text: `Error: ${error instanceof Error ? error.message : 'Unknown error'}`,
         threadId: msg.threadId,
       });
     } finally {
+      console.log('[Bot] Closing session');
       session!?.close();
     }
   }

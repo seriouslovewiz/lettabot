@@ -6,9 +6,8 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import * as p from '@clack/prompts';
-
-const ENV_PATH = resolve(process.cwd(), '.env');
-const ENV_EXAMPLE_PATH = resolve(process.cwd(), '.env.example');
+import { saveConfig, syncProviders } from './config/index.js';
+import type { LettaBotConfig, ProviderConfig } from './config/types.js';
 
 // ============================================================================
 // Config Types
@@ -16,8 +15,10 @@ const ENV_EXAMPLE_PATH = resolve(process.cwd(), '.env.example');
 
 interface OnboardConfig {
   // Auth
-  authMethod: 'keep' | 'oauth' | 'apikey' | 'skip';
+  authMethod: 'keep' | 'oauth' | 'apikey' | 'selfhosted' | 'skip';
   apiKey?: string;
+  baseUrl?: string;
+  billingTier?: string;
   
   // Agent  
   agentChoice: 'new' | 'existing' | 'env' | 'skip';
@@ -26,6 +27,9 @@ interface OnboardConfig {
   
   // Model (only for new agents)
   model?: string;
+  
+  // BYOK Providers (for free tier)
+  providers?: Array<{ id: string; name: string; apiKey: string }>;
   
   // Channels (with access control)
   telegram: { enabled: boolean; token?: string; dmPolicy?: 'pairing' | 'allowlist' | 'open'; allowedUsers?: string[] };
@@ -39,60 +43,6 @@ interface OnboardConfig {
   cron: boolean;
 }
 
-// ============================================================================
-// Env Helpers
-// ============================================================================
-
-function loadEnv(): Record<string, string> {
-  const env: Record<string, string> = {};
-  if (existsSync(ENV_PATH)) {
-    const content = readFileSync(ENV_PATH, 'utf-8');
-    for (const line of content.split('\n')) {
-      if (line.startsWith('#') || !line.includes('=')) continue;
-      const [key, ...valueParts] = line.split('=');
-      env[key.trim()] = valueParts.join('=').trim();
-    }
-  }
-  return env;
-}
-
-function saveEnv(env: Record<string, string>): void {
-  // Start with .env.example as template, fall back to existing .env if example doesn't exist
-  let content = '';
-  if (existsSync(ENV_EXAMPLE_PATH)) {
-    content = readFileSync(ENV_EXAMPLE_PATH, 'utf-8');
-  } else if (existsSync(ENV_PATH)) {
-    content = readFileSync(ENV_PATH, 'utf-8');
-  }
-  
-  // Track which keys we've seen in the template to detect deletions
-  const keysInTemplate = new Set<string>();
-  for (const line of content.split('\n')) {
-    const match = line.match(/^#?\s*(\w+)=/);
-    if (match) keysInTemplate.add(match[1]);
-  }
-  
-  // Update or add keys that exist in env
-  for (const [key, value] of Object.entries(env)) {
-    const regex = new RegExp(`^#?\\s*${key}=.*$`, 'm');
-    if (regex.test(content)) {
-      content = content.replace(regex, `${key}=${value}`);
-    } else {
-      content += `\n${key}=${value}`;
-    }
-  }
-  
-  // Comment out keys that were in template but deleted from env
-  for (const key of keysInTemplate) {
-    if (!(key in env)) {
-      const regex = new RegExp(`^(${key}=.*)$`, 'm');
-      content = content.replace(regex, '# $1');
-    }
-  }
-  
-  writeFileSync(ENV_PATH, content);
-}
-
 const isPlaceholder = (val?: string) => !val || /^(your_|sk-\.\.\.|placeholder|example)/i.test(val);
 
 // ============================================================================
@@ -103,11 +53,12 @@ async function stepAuth(config: OnboardConfig, env: Record<string, string>): Pro
   const { requestDeviceCode, pollForToken, LETTA_CLOUD_API_URL } = await import('./auth/oauth.js');
   const { saveTokens, loadTokens, getOrCreateDeviceId, getDeviceName } = await import('./auth/tokens.js');
   
-  const baseUrl = env.LETTA_BASE_URL || process.env.LETTA_BASE_URL;
+  const baseUrl = config.baseUrl || env.LETTA_BASE_URL || process.env.LETTA_BASE_URL;
   const isLettaCloud = !baseUrl || baseUrl === LETTA_CLOUD_API_URL || baseUrl === 'https://api.letta.com';
   
   const existingTokens = loadTokens();
-  const realApiKey = isPlaceholder(env.LETTA_API_KEY) ? undefined : env.LETTA_API_KEY;
+  // Check both env and config for existing API key
+  const realApiKey = config.apiKey || (isPlaceholder(env.LETTA_API_KEY) ? undefined : env.LETTA_API_KEY);
   const validOAuthToken = isLettaCloud ? existingTokens?.accessToken : undefined;
   const hasExistingAuth = !!realApiKey || !!validOAuthToken;
   const displayKey = realApiKey || validOAuthToken;
@@ -123,7 +74,8 @@ async function stepAuth(config: OnboardConfig, env: Record<string, string>): Pro
     ...(hasExistingAuth ? [{ value: 'keep', label: getAuthLabel(), hint: displayKey?.slice(0, 20) + '...' }] : []),
     ...(isLettaCloud ? [{ value: 'oauth', label: 'Login to Letta Platform', hint: 'Opens browser' }] : []),
     { value: 'apikey', label: 'Enter API Key manually', hint: 'Paste your key' },
-    { value: 'skip', label: 'Skip', hint: 'Local server without auth' },
+    { value: 'selfhosted', label: 'Enter self-hosted URL', hint: 'Local Letta server' },
+    { value: 'skip', label: 'Skip', hint: 'Continue without auth' },
   ];
   
   const authMethod = await p.select({
@@ -194,6 +146,22 @@ async function stepAuth(config: OnboardConfig, env: Record<string, string>): Pro
       config.apiKey = apiKey;
       env.LETTA_API_KEY = apiKey;
     }
+  } else if (authMethod === 'selfhosted') {
+    const serverUrl = await p.text({ 
+      message: 'Letta server URL',
+      placeholder: 'http://localhost:8283',
+      initialValue: config.baseUrl || 'http://localhost:8283',
+    });
+    if (p.isCancel(serverUrl)) { p.cancel('Setup cancelled'); process.exit(0); }
+    
+    const url = serverUrl || 'http://localhost:8283';
+    config.baseUrl = url;
+    env.LETTA_BASE_URL = url;
+    process.env.LETTA_BASE_URL = url; // Set immediately so model listing works
+    
+    // Clear any cloud API key since we're using self-hosted
+    delete env.LETTA_API_KEY;
+    delete process.env.LETTA_API_KEY;
   } else if (authMethod === 'keep') {
     // For OAuth tokens, refresh if needed
     if (existingTokens?.refreshToken) {
@@ -238,7 +206,7 @@ async function stepAuth(config: OnboardConfig, env: Record<string, string>): Pro
     }
   }
   
-  // Validate connection (only if not skipping auth)
+  // Validate connection (skip if 'skip' was chosen)
   if (config.authMethod !== 'skip') {
     const keyToValidate = config.apiKey || env.LETTA_API_KEY;
     if (keyToValidate) {
@@ -246,11 +214,16 @@ async function stepAuth(config: OnboardConfig, env: Record<string, string>): Pro
     }
     
     const spinner = p.spinner();
-    spinner.start('Checking connection...');
+    const serverLabel = config.baseUrl || 'Letta Cloud';
+    spinner.start(`Checking connection to ${serverLabel}...`);
     try {
       const { testConnection } = await import('./tools/letta-api.js');
       const ok = await testConnection();
-      spinner.stop(ok ? 'Connected to server' : 'Connection issue');
+      spinner.stop(ok ? `Connected to ${serverLabel}` : 'Connection issue');
+      
+      if (!ok && config.authMethod === 'selfhosted') {
+        p.log.warn(`Could not connect to ${config.baseUrl}. Make sure the server is running.`);
+      }
     } catch {
       spinner.stop('Connection check skipped');
     }
@@ -333,28 +306,161 @@ async function stepAgent(config: OnboardConfig, env: Record<string, string>): Pr
   }
 }
 
+// BYOK Provider definitions (same as letta-code)
+const BYOK_PROVIDERS = [
+  { id: 'anthropic', name: 'lc-anthropic', displayName: 'Anthropic (Claude)', providerType: 'anthropic' },
+  { id: 'openai', name: 'lc-openai', displayName: 'OpenAI', providerType: 'openai' },
+  { id: 'gemini', name: 'lc-gemini', displayName: 'Google Gemini', providerType: 'google_ai' },
+  { id: 'zai', name: 'lc-zai', displayName: 'zAI', providerType: 'zai' },
+  { id: 'minimax', name: 'lc-minimax', displayName: 'MiniMax', providerType: 'minimax' },
+  { id: 'openrouter', name: 'lc-openrouter', displayName: 'OpenRouter', providerType: 'openrouter' },
+];
+
+async function stepProviders(config: OnboardConfig, env: Record<string, string>): Promise<void> {
+  // Only for free tier users on Letta Cloud (not self-hosted, not paid)
+  if (config.authMethod === 'selfhosted') return;
+  if (config.billingTier !== 'free') return;
+  
+  const selectedProviders = await p.multiselect({
+    message: 'Add LLM provider keys (optional - for BYOK models)',
+    options: BYOK_PROVIDERS.map(provider => ({
+      value: provider.id,
+      label: provider.displayName,
+      hint: `Connect your ${provider.displayName} API key`,
+    })),
+    required: false,
+  });
+  
+  if (p.isCancel(selectedProviders)) { p.cancel('Setup cancelled'); process.exit(0); }
+  
+  // If no providers selected, skip
+  if (!selectedProviders || selectedProviders.length === 0) {
+    return;
+  }
+  
+  config.providers = [];
+  const apiKey = config.apiKey || env.LETTA_API_KEY || process.env.LETTA_API_KEY;
+  
+  // Collect API keys for each selected provider
+  for (const providerId of selectedProviders as string[]) {
+    const provider = BYOK_PROVIDERS.find(p => p.id === providerId);
+    if (!provider) continue;
+    
+    const providerKey = await p.text({
+      message: `${provider.displayName} API Key`,
+      placeholder: 'sk-...',
+    });
+    
+    if (p.isCancel(providerKey)) { p.cancel('Setup cancelled'); process.exit(0); }
+    
+    if (providerKey) {
+      // Create or update provider via Letta API
+      const spinner = p.spinner();
+      spinner.start(`Connecting ${provider.displayName}...`);
+      
+      try {
+        // First check if provider already exists
+        const listResponse = await fetch('https://api.letta.com/v1/providers', {
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`,
+          },
+        });
+        
+        let existingProvider: { id: string; name: string } | undefined;
+        if (listResponse.ok) {
+          const providers = await listResponse.json() as Array<{ id: string; name: string }>;
+          existingProvider = providers.find(p => p.name === provider.name);
+        }
+        
+        let response: Response;
+        if (existingProvider) {
+          // Update existing provider
+          response = await fetch(`https://api.letta.com/v1/providers/${existingProvider.id}`, {
+            method: 'PATCH',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${apiKey}`,
+            },
+            body: JSON.stringify({
+              api_key: providerKey,
+            }),
+          });
+        } else {
+          // Create new provider
+          response = await fetch('https://api.letta.com/v1/providers', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${apiKey}`,
+            },
+            body: JSON.stringify({
+              name: provider.name,
+              provider_type: provider.providerType,
+              api_key: providerKey,
+            }),
+          });
+        }
+        
+        if (response.ok) {
+          spinner.stop(`Connected ${provider.displayName}`);
+          config.providers.push({ id: provider.id, name: provider.name, apiKey: providerKey });
+        } else {
+          const error = await response.text();
+          spinner.stop(`Failed to connect ${provider.displayName}: ${error}`);
+        }
+      } catch (err) {
+        spinner.stop(`Failed to connect ${provider.displayName}`);
+      }
+    }
+  }
+}
+
 async function stepModel(config: OnboardConfig, env: Record<string, string>): Promise<void> {
   // Only for new agents
   if (config.agentChoice !== 'new') return;
   
-  const { buildModelOptions, handleModelSelection } = await import('./utils/model-selection.js');
+  const { buildModelOptions, handleModelSelection, getBillingTier } = await import('./utils/model-selection.js');
   
   const spinner = p.spinner();
+  
+  // Determine if self-hosted (not Letta Cloud)
+  const isSelfHosted = config.authMethod === 'selfhosted';
+  
+  // Fetch billing tier for Letta Cloud users (if not already fetched)
+  let billingTier: string | null = config.billingTier || null;
+  if (!isSelfHosted && !billingTier) {
+    spinner.start('Checking account...');
+    const apiKey = config.apiKey || env.LETTA_API_KEY || process.env.LETTA_API_KEY;
+    billingTier = await getBillingTier(apiKey, isSelfHosted);
+    config.billingTier = billingTier ?? undefined;
+    spinner.stop(billingTier === 'free' ? 'Free plan' : `Plan: ${billingTier || 'unknown'}`);
+  }
+  
   spinner.start('Fetching models...');
-  const modelOptions = await buildModelOptions();
+  const apiKey = config.apiKey || env.LETTA_API_KEY || process.env.LETTA_API_KEY;
+  const modelOptions = await buildModelOptions({ billingTier, isSelfHosted, apiKey });
   spinner.stop('Models loaded');
   
-  const modelChoice = await p.select({
-    message: 'Select model',
-    options: modelOptions,
-    maxItems: 10,
-  });
-  if (p.isCancel(modelChoice)) { p.cancel('Setup cancelled'); process.exit(0); }
-  
-  const selectedModel = await handleModelSelection(modelChoice, p.text);
-  if (selectedModel) {
-    config.model = selectedModel;
+  // Show appropriate message for free tier
+  if (billingTier === 'free') {
+    p.log.info('Free plan: GLM and MiniMax models are free. Other models require BYOK (Bring Your Own Key).');
   }
+  
+  let selectedModel: string | null = null;
+  while (!selectedModel) {
+    const modelChoice = await p.select({
+      message: 'Select model',
+      options: modelOptions,
+      maxItems: 12,
+    });
+    if (p.isCancel(modelChoice)) { p.cancel('Setup cancelled'); process.exit(0); }
+    
+    selectedModel = await handleModelSelection(modelChoice, p.text);
+    // If null (e.g., header selected), loop again
+  }
+  
+  config.model = selectedModel;
 }
 
 async function stepChannels(config: OnboardConfig, env: Record<string, string>): Promise<void> {
@@ -623,7 +729,8 @@ function showSummary(config: OnboardConfig): void {
     keep: 'Keep existing',
     oauth: 'OAuth login',
     apikey: config.apiKey ? `API Key (${config.apiKey.slice(0, 10)}...)` : 'API Key',
-    skip: 'None (local server)',
+    selfhosted: config.baseUrl ? `Self-hosted (${config.baseUrl})` : 'Self-hosted',
+    skip: 'None',
   }[config.authMethod];
   lines.push(`Auth:      ${authLabel}`);
   
@@ -681,7 +788,10 @@ async function reviewLoop(config: OnboardConfig, env: Record<string, string>): P
     if (choice === 'auth') await stepAuth(config, env);
     else if (choice === 'agent') {
       await stepAgent(config, env);
-      if (config.agentChoice === 'new') await stepModel(config, env);
+      if (config.agentChoice === 'new') {
+        await stepProviders(config, env);
+        await stepModel(config, env);
+      }
     }
     else if (choice === 'channels') await stepChannels(config, env);
     else if (choice === 'features') await stepFeatures(config);
@@ -693,12 +803,23 @@ async function reviewLoop(config: OnboardConfig, env: Record<string, string>): P
 // ============================================================================
 
 export async function onboard(): Promise<void> {
-  const env = loadEnv();
+  // Temporary storage for wizard values
+  const env: Record<string, string> = {};
+  
+  // Load existing config if available
+  const { loadConfig, resolveConfigPath } = await import('./config/index.js');
+  const existingConfig = loadConfig();
+  const configPath = resolveConfigPath();
+  const hasExistingConfig = existsSync(configPath);
   
   p.intro('🤖 LettaBot Setup');
   
-  // Show server info
-  const baseUrl = env.LETTA_BASE_URL || process.env.LETTA_BASE_URL || 'https://api.letta.com';
+  if (hasExistingConfig) {
+    p.log.info(`Loading existing config from ${configPath}`);
+  }
+  
+  // Pre-populate from existing config
+  const baseUrl = existingConfig.server.baseUrl || process.env.LETTA_BASE_URL || 'https://api.letta.com';
   const isLocal = baseUrl.includes('localhost') || baseUrl.includes('127.0.0.1');
   p.note(`${baseUrl}\n${isLocal ? 'Local Docker' : 'Letta Cloud'}`, 'Server');
   
@@ -724,39 +845,62 @@ export async function onboard(): Promise<void> {
   }
   
   // Initialize config from existing env
+  // Pre-populate from existing YAML config
   const config: OnboardConfig = {
-    authMethod: 'skip',
+    authMethod: hasExistingConfig ? 'keep' : 'skip',
+    apiKey: existingConfig.server.apiKey,
+    baseUrl: existingConfig.server.baseUrl,
     telegram: { 
-      enabled: !!env.TELEGRAM_BOT_TOKEN && !isPlaceholder(env.TELEGRAM_BOT_TOKEN),
-      token: isPlaceholder(env.TELEGRAM_BOT_TOKEN) ? undefined : env.TELEGRAM_BOT_TOKEN,
+      enabled: existingConfig.channels.telegram?.enabled || false,
+      token: existingConfig.channels.telegram?.token,
+      dmPolicy: existingConfig.channels.telegram?.dmPolicy,
+      allowedUsers: existingConfig.channels.telegram?.allowedUsers?.map(String),
     },
     slack: { 
-      enabled: !!env.SLACK_BOT_TOKEN,
-      appToken: env.SLACK_APP_TOKEN,
-      botToken: env.SLACK_BOT_TOKEN,
+      enabled: existingConfig.channels.slack?.enabled || false,
+      appToken: existingConfig.channels.slack?.appToken,
+      botToken: existingConfig.channels.slack?.botToken,
+      allowedUsers: existingConfig.channels.slack?.allowedUsers,
     },
     whatsapp: { 
-      enabled: env.WHATSAPP_ENABLED === 'true',
-      selfChat: env.WHATSAPP_SELF_CHAT_MODE === 'true',
+      enabled: existingConfig.channels.whatsapp?.enabled || false,
+      selfChat: existingConfig.channels.whatsapp?.selfChat,
+      dmPolicy: existingConfig.channels.whatsapp?.dmPolicy,
     },
     signal: { 
-      enabled: !!env.SIGNAL_PHONE_NUMBER,
-      phone: env.SIGNAL_PHONE_NUMBER,
+      enabled: existingConfig.channels.signal?.enabled || false,
+      phone: existingConfig.channels.signal?.phone,
+      dmPolicy: existingConfig.channels.signal?.dmPolicy,
     },
     gmail: { enabled: false },
     heartbeat: { 
-      enabled: !!env.HEARTBEAT_INTERVAL_MIN,
-      interval: env.HEARTBEAT_INTERVAL_MIN,
+      enabled: existingConfig.features?.heartbeat?.enabled || false,
+      interval: existingConfig.features?.heartbeat?.intervalMin?.toString(),
     },
-    cron: env.CRON_ENABLED === 'true',
-    agentChoice: 'skip',
-    agentName: env.AGENT_NAME,
-    model: env.MODEL,
+    cron: existingConfig.features?.cron || false,
+    agentChoice: hasExistingConfig ? 'env' : 'skip',
+    agentName: existingConfig.agent.name,
+    agentId: existingConfig.agent.id,
+    model: existingConfig.agent.model,
+    providers: existingConfig.providers?.map(p => ({ id: p.id, name: p.name, apiKey: p.apiKey })),
   };
   
   // Run through all steps
   await stepAuth(config, env);
   await stepAgent(config, env);
+  
+  // Fetch billing tier for free plan detection (only for Letta Cloud)
+  if (config.authMethod !== 'selfhosted' && config.agentChoice === 'new') {
+    const { getBillingTier } = await import('./utils/model-selection.js');
+    const spinner = p.spinner();
+    spinner.start('Checking account...');
+    const apiKey = config.apiKey || env.LETTA_API_KEY || process.env.LETTA_API_KEY;
+    const billingTier = await getBillingTier(apiKey, false);
+    config.billingTier = billingTier ?? undefined;
+    spinner.stop(billingTier === 'free' ? 'Free plan' : `Plan: ${billingTier || 'Pro'}`);
+  }
+  
+  await stepProviders(config, env);
   await stepModel(config, env);
   await stepChannels(config, env);
   await stepFeatures(config);
@@ -865,9 +1009,87 @@ export async function onboard(): Promise<void> {
   
   p.note(summary, 'Configuration Summary');
   
-  // Save
-  saveEnv(env);
-  p.log.success('Configuration saved to .env');
+  // Convert to YAML config
+  const yamlConfig: LettaBotConfig = {
+    server: {
+      mode: config.authMethod === 'selfhosted' ? 'selfhosted' : 'cloud',
+      ...(config.authMethod === 'selfhosted' && config.baseUrl ? { baseUrl: config.baseUrl } : {}),
+      ...(config.apiKey ? { apiKey: config.apiKey } : {}),
+    },
+    agent: {
+      name: config.agentName || 'LettaBot',
+      model: config.model || 'zai/glm-4.7',
+      ...(config.agentId ? { id: config.agentId } : {}),
+    },
+    channels: {
+      ...(config.telegram.enabled ? {
+        telegram: {
+          enabled: true,
+          token: config.telegram.token,
+          dmPolicy: config.telegram.dmPolicy,
+          allowedUsers: config.telegram.allowedUsers,
+        }
+      } : {}),
+      ...(config.slack.enabled ? {
+        slack: {
+          enabled: true,
+          appToken: config.slack.appToken,
+          botToken: config.slack.botToken,
+          allowedUsers: config.slack.allowedUsers,
+        }
+      } : {}),
+      ...(config.whatsapp.enabled ? {
+        whatsapp: {
+          enabled: true,
+          selfChat: config.whatsapp.selfChat,
+          dmPolicy: config.whatsapp.dmPolicy,
+          allowedUsers: config.whatsapp.allowedUsers,
+        }
+      } : {}),
+      ...(config.signal.enabled ? {
+        signal: {
+          enabled: true,
+          phone: config.signal.phone,
+          dmPolicy: config.signal.dmPolicy,
+          allowedUsers: config.signal.allowedUsers,
+        }
+      } : {}),
+    },
+    features: {
+      cron: config.cron,
+      heartbeat: {
+        enabled: config.heartbeat.enabled,
+        intervalMin: config.heartbeat.interval ? parseInt(config.heartbeat.interval) : undefined,
+      },
+    },
+  };
+  
+  // Add BYOK providers if configured
+  if (config.providers && config.providers.length > 0) {
+    yamlConfig.providers = config.providers.map(p => ({
+      id: p.id,
+      name: p.name,
+      type: p.id, // id is the type (anthropic, openai, etc.)
+      apiKey: p.apiKey,
+    }));
+  }
+  
+  // Save YAML config (use project-local path)
+  const savePath = resolve(process.cwd(), 'lettabot.yaml');
+  saveConfig(yamlConfig, savePath);
+  p.log.success('Configuration saved to lettabot.yaml');
+  
+  // Sync BYOK providers to Letta Cloud
+  if (yamlConfig.providers && yamlConfig.providers.length > 0 && yamlConfig.server.mode === 'cloud') {
+    const spinner = p.spinner();
+    spinner.start('Syncing BYOK providers to Letta Cloud...');
+    try {
+      await syncProviders(yamlConfig);
+      spinner.stop('BYOK providers synced');
+    } catch (err) {
+      spinner.stop('Failed to sync providers (will retry on startup)');
+    }
+  }
   
   // Save agent ID with server URL
   if (config.agentId) {

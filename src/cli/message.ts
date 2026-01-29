@@ -10,7 +10,10 @@
  * (heartbeats, cron jobs) or to send to different channels during conversations.
  */
 
-import 'dotenv/config';
+// Config loaded from lettabot.yaml
+import { loadConfig, applyConfigToEnv } from '../config/index.js';
+const config = loadConfig();
+applyConfigToEnv(config);
 import { resolve } from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
 

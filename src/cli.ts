@@ -8,7 +8,10 @@
  *   lettabot configure  - Configure settings
  */
 
-import 'dotenv/config';
+// Config loaded from lettabot.yaml
+import { loadConfig, applyConfigToEnv } from './config/index.js';
+const config = loadConfig();
+applyConfigToEnv(config);
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
@@ -18,60 +21,8 @@ const args = process.argv.slice(2);
 const command = args[0];
 const subCommand = args[1];
 
-const ENV_PATH = resolve(process.cwd(), '.env');
-const ENV_EXAMPLE_PATH = resolve(process.cwd(), '.env.example');
-
 // Check if value is a placeholder
 const isPlaceholder = (val?: string) => !val || /^(your_|sk-\.\.\.|placeholder|example)/i.test(val);
-
-// Simple prompt helper
-function prompt(question: string): Promise<string> {
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
-  return new Promise((resolve) => {
-    rl.question(question, (answer) => {
-      rl.close();
-      resolve(answer.trim());
-    });
-  });
-}
-
-// Load current env values
-function loadEnv(): Record<string, string> {
-  const env: Record<string, string> = {};
-  if (existsSync(ENV_PATH)) {
-    const content = readFileSync(ENV_PATH, 'utf-8');
-    for (const line of content.split('\n')) {
-      if (line.startsWith('#') || !line.includes('=')) continue;
-      const [key, ...valueParts] = line.split('=');
-      env[key.trim()] = valueParts.join('=').trim();
-    }
-  }
-  return env;
-}
-
-// Save env values
-function saveEnv(env: Record<string, string>): void {
-  // Start with example if no .env exists
-  let content = '';
-  if (existsSync(ENV_EXAMPLE_PATH)) {
-    content = readFileSync(ENV_EXAMPLE_PATH, 'utf-8');
-  }
-  
-  // Update values
-  for (const [key, value] of Object.entries(env)) {
-    const regex = new RegExp(`^#?\\s*${key}=.*$`, 'm');
-    if (regex.test(content)) {
-      content = content.replace(regex, `${key}=${value}`);
-    } else {
-      content += `\n${key}=${value}`;
-    }
-  }
-  
-  writeFileSync(ENV_PATH, content);
-}
 
 
 // Import onboard from separate module
@@ -79,29 +30,21 @@ import { onboard } from './onboard.js';
 
 async function configure() {
   const p = await import('@clack/prompts');
+  const { resolveConfigPath } = await import('./config/index.js');
   
   p.intro('🤖 LettaBot Configuration');
 
-  const env = loadEnv();
-  
-  // Check both .env file and shell environment, filtering placeholders
-  const checkVar = (key: string) => {
-    const fileValue = env[key];
-    const envValue = process.env[key];
-    const value = fileValue || envValue;
-    return isPlaceholder(value) ? undefined : value;
-  };
-  
+  // Show current config from YAML
   const configRows = [
-    ['LETTA_API_KEY', checkVar('LETTA_API_KEY') ? '✓ Set' : '✗ Not set'],
-    ['TELEGRAM_BOT_TOKEN', checkVar('TELEGRAM_BOT_TOKEN') ? '✓ Set' : '✗ Not set'],
-    ['SLACK_BOT_TOKEN', checkVar('SLACK_BOT_TOKEN') ? '✓ Set' : '✗ Not set'],
-    ['SLACK_APP_TOKEN', checkVar('SLACK_APP_TOKEN') ? '✓ Set' : '✗ Not set'],
-    ['HEARTBEAT_INTERVAL_MIN', checkVar('HEARTBEAT_INTERVAL_MIN') || 'Not set'],
-    ['CRON_ENABLED', checkVar('CRON_ENABLED') || 'false'],
-    ['WORKING_DIR', checkVar('WORKING_DIR') || '/tmp/lettabot'],
-    ['AGENT_NAME', checkVar('AGENT_NAME') || 'LettaBot'],
-    ['MODEL', checkVar('MODEL') || '(default)'],
+    ['Server Mode', config.server.mode],
+    ['API Key', config.server.apiKey ? '✓ Set' : '✗ Not set'],
+    ['Agent Name', config.agent.name],
+    ['Model', config.agent.model],
+    ['Telegram', config.channels.telegram?.enabled ? '✓ Enabled' : '✗ Disabled'],
+    ['Slack', config.channels.slack?.enabled ? '✓ Enabled' : '✗ Disabled'],
+    ['Cron', config.features?.cron ? '✓ Enabled' : '✗ Disabled'],
+    ['Heartbeat', config.features?.heartbeat?.enabled ? `✓ ${config.features.heartbeat.intervalMin}min` : '✗ Disabled'],
+    ['BYOK Providers', config.providers?.length ? config.providers.map(p => p.name).join(', ') : 'None'],
   ];
   
   const maxKeyLength = Math.max(...configRows.map(([key]) => key.length));
@@ -109,20 +52,14 @@ async function configure() {
     .map(([key, value]) => `${(key + ':').padEnd(maxKeyLength + 1)} ${value}`)
     .join('\n');
   
-  p.note(summary, 'Current Configuration');
+  p.note(summary, `Current Configuration (${resolveConfigPath()})`);
   
   const choice = await p.select({
-    message: 'What would you like to configure?',
+    message: 'What would you like to do?',
     options: [
-      { value: '1', label: 'Letta API Key', hint: '' },
-      { value: '2', label: 'Telegram', hint: '' },
-      { value: '3', label: 'Slack', hint: '' },
-      { value: '4', label: 'Heartbeat', hint: '' },
-      { value: '5', label: 'Cron', hint: '' },
-      { value: '6', label: 'Working Directory', hint: '' },
-      { value: '7', label: 'Agent Name & Model', hint: '' },
-      { value: '8', label: 'Edit .env directly', hint: '' },
-      { value: '9', label: 'Exit', hint: '' },
+      { value: 'onboard', label: 'Run setup wizard', hint: 'lettabot onboard' },
+      { value: 'edit', label: 'Edit config file', hint: resolveConfigPath() },
+      { value: 'exit', label: 'Exit', hint: '' },
     ],
   });
   
@@ -132,89 +69,28 @@ async function configure() {
   }
   
   switch (choice) {
-    case '1':
-      env.LETTA_API_KEY = await prompt('Enter Letta API Key: ');
-      saveEnv(env);
-      console.log('✓ Saved');
+    case 'onboard':
+      await onboard();
       break;
-    case '2':
-      env.TELEGRAM_BOT_TOKEN = await prompt('Enter Telegram Bot Token: ');
-      saveEnv(env);
-      console.log('✓ Saved');
-      break;
-    case '3':
-      env.SLACK_BOT_TOKEN = await prompt('Enter Slack Bot Token: ');
-      env.SLACK_APP_TOKEN = await prompt('Enter Slack App Token: ');
-      saveEnv(env);
-      console.log('✓ Saved');
-      break;
-    case '4':
-      env.HEARTBEAT_INTERVAL_MIN = await prompt('Heartbeat interval (minutes, 0 to disable): ');
-      saveEnv(env);
-      console.log('✓ Saved');
-      break;
-    case '5':
-      env.CRON_ENABLED = (await prompt('Enable cron? (y/n): ')).toLowerCase() === 'y' ? 'true' : 'false';
-      saveEnv(env);
-      console.log('✓ Saved');
-      break;
-    case '6':
-      env.WORKING_DIR = await prompt('Working directory: ');
-      saveEnv(env);
-      console.log('✓ Saved');
-      break;
-    case '7': {
-      const p = await import('@clack/prompts');
-      const { buildModelOptions, handleModelSelection } = await import('./utils/model-selection.js');
-      
-      const currentName = env.AGENT_NAME || 'LettaBot';
-      const name = await p.text({
-        message: 'Agent name',
-        placeholder: currentName,
-        initialValue: currentName,
-      });
-      if (!p.isCancel(name) && name) env.AGENT_NAME = name;
-      
-      const currentModel = env.MODEL || 'default';
-      p.log.info(`Current model: ${currentModel}\n`);
-      
-      const spinner = p.spinner();
-      spinner.start('Fetching available models...');
-      const modelOptions = await buildModelOptions();
-      spinner.stop('Models loaded');
-      
-      const modelChoice = await p.select({
-        message: 'Select model',
-        options: modelOptions,
-        maxItems: 10,
-      });
-      
-      if (!p.isCancel(modelChoice)) {
-        const selectedModel = await handleModelSelection(modelChoice, p.text);
-        if (selectedModel) {
-          env.MODEL = selectedModel;
-        }
-      }
-      
-      saveEnv(env);
-      p.log.success('Saved');
+    case 'edit': {
+      const configPath = resolveConfigPath();
+      const editor = process.env.EDITOR || 'nano';
+      console.log(`Opening ${configPath} in ${editor}...`);
+      spawnSync(editor, [configPath], { stdio: 'inherit' });
       break;
     }
-    case '8':
-      const editor = process.env.EDITOR || 'nano';
-      spawnSync(editor, [ENV_PATH], { stdio: 'inherit' });
+    case 'exit':
       break;
-    case '9':
-      return;
-    default:
-      console.log('Invalid choice');
   }
 }
 
 async function server() {
+  const { resolveConfigPath } = await import('./config/index.js');
+  const configPath = resolveConfigPath();
+  
   // Check if configured
-  if (!existsSync(ENV_PATH)) {
-    console.log('No .env found. Run "lettabot onboard" first.\n');
+  if (!existsSync(configPath)) {
+    console.log(`No config found at ${configPath}. Run "lettabot onboard" first.\n`);
     process.exit(1);
   }
   

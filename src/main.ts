@@ -5,11 +5,20 @@
  * Chat continues seamlessly between Telegram, Slack, and WhatsApp.
  */
 
-import 'dotenv/config';
 import { createServer } from 'node:http';
 import { existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { spawn } from 'node:child_process';
+
+// Load YAML config and apply to process.env (overrides .env values)
+import { loadConfig, applyConfigToEnv, syncProviders, resolveConfigPath } from './config/index.js';
+const yamlConfig = loadConfig();
+console.log(`[Config] Loaded from ${resolveConfigPath()}`);
+console.log(`[Config] Mode: ${yamlConfig.server.mode}, Agent: ${yamlConfig.agent.name}, Model: ${yamlConfig.agent.model}`);
+applyConfigToEnv(yamlConfig);
+
+// Sync BYOK providers on startup (async, don't block)
+syncProviders(yamlConfig).catch(err => console.error('[Config] Failed to sync providers:', err));
 
 // Load agent ID from store and set as env var (SDK needs this)
 // Load agent ID from store file, or use LETTA_AGENT_ID env var as fallback
@@ -110,13 +119,11 @@ import { PollingService } from './polling/service.js';
 import { agentExists } from './tools/letta-api.js';
 import { installSkillsToWorkingDir } from './skills/loader.js';
 
-// Check if setup is needed
-const ENV_PATH = resolve(process.cwd(), '.env');
-if (!existsSync(ENV_PATH)) {
-  console.log('\n  No .env file found. Running setup wizard...\n');
-  const setupPath = new URL('./setup.ts', import.meta.url).pathname;
-  spawn('npx', ['tsx', setupPath], { stdio: 'inherit', cwd: process.cwd() });
-  process.exit(0);
+// Check if config exists
+const configPath = resolveConfigPath();
+if (!existsSync(configPath)) {
+  console.log(`\n  No config found at ${configPath}. Run "lettabot onboard" first.\n`);
+  process.exit(1);
 }
 
 // Parse heartbeat target (format: "telegram:123456789" or "slack:C1234567890")
