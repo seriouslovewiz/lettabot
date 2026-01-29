@@ -462,7 +462,9 @@ async function stepModel(config: OnboardConfig, env: Record<string, string>): Pr
   }
   
   spinner.start('Fetching models...');
-  const modelOptions = await buildModelOptions({ billingTier, isSelfHosted });
+  // Pass connected provider IDs so we show models from those providers
+  const connectedProviders = config.providers?.map(p => p.id) || [];
+  const modelOptions = await buildModelOptions({ billingTier, isSelfHosted, connectedProviders });
   spinner.stop('Models loaded');
   
   // Show appropriate message for free tier
