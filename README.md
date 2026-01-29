@@ -110,7 +110,7 @@ At least one channel is required. Telegram is the easiest to start with.
 | `/heartbeat` | Manually trigger a heartbeat check-in |
 
 ## Connect to Letta Code 
-Any LettaBot agent can also be directly chatted with through Letta Code. Use the `/status` command to find your `agent_id`, and run: 
+Any LettaBot agent can also be directly chatted with through [Letta Code](https://github.com/letta-ai/letta-code). Use the `/status` command to find your `agent_id`, and run: 
 ```sh
 letta --agent <agent_id>
 ```
