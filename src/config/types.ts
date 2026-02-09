@@ -62,7 +62,9 @@ export interface LettaBotConfig {
   agent: {
     id?: string;
     name: string;
-    model: string;
+    // model is configured on the Letta agent server-side, not in config
+    // Kept as optional for backward compat (ignored if present in existing configs)
+    model?: string;
   };
 
   // BYOK providers (cloud mode only)
@@ -207,7 +209,7 @@ export const DEFAULT_CONFIG: LettaBotConfig = {
   },
   agent: {
     name: 'LettaBot',
-    model: 'zai/glm-4.7', // Free model default
+    // model is configured on the Letta agent server-side (via onboarding or `lettabot model set`)
   },
   channels: {},
 };

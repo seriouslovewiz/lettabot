@@ -23,7 +23,10 @@ console.log(`[Config] Loaded from ${configSource}`);
 if (yamlConfig.agents?.length) {
   console.log(`[Config] Mode: ${yamlConfig.server.mode}, Agents: ${yamlConfig.agents.map(a => a.name).join(', ')}`);
 } else {
-  console.log(`[Config] Mode: ${yamlConfig.server.mode}, Agent: ${yamlConfig.agent.name}, Model: ${yamlConfig.agent.model}`);
+  console.log(`[Config] Mode: ${yamlConfig.server.mode}, Agent: ${yamlConfig.agent.name}`);
+}
+if (yamlConfig.agent?.model) {
+  console.warn('[Config] WARNING: agent.model in lettabot.yaml is deprecated and ignored. Use `lettabot model set <handle>` instead.');
 }
 applyConfigToEnv(yamlConfig);
 
@@ -472,7 +475,6 @@ async function main() {
     const bot = new LettaBot({
       workingDir: globalConfig.workingDir,
       agentName: agentConfig.name,
-      model: agentConfig.model,
       allowedTools: globalConfig.allowedTools,
       maxToolCalls: agentConfig.features?.maxToolCalls,
       skills: {

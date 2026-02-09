@@ -425,7 +425,6 @@ export class LettaBot implements AgentSession {
         // Create new agent with default conversation
         console.log('[Bot] Creating new agent');
         const newAgentId = await createAgent({
-          model: this.config.model,
           systemPrompt: SYSTEM_PROMPT,
           memory: loadMemoryBlocks(this.config.agentName),
         });
@@ -862,7 +861,6 @@ export class LettaBot implements AgentSession {
     } else {
       // Create new agent with default conversation
       const newAgentId = await createAgent({
-        model: this.config.model,
         systemPrompt: SYSTEM_PROMPT,
         memory: loadMemoryBlocks(this.config.agentName),
       });
