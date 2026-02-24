@@ -234,11 +234,28 @@ Each entry in `agents:` accepts:
 | `id` | string | No | Use existing agent ID (skips creation) |
 | `displayName` | string | No | Prefix outbound messages (e.g. `"💜 Signo"`) |
 | `model` | string | No | Model for agent creation |
-| `conversations` | object | No | Conversation routing config (shared vs per-channel) |
+| `conversations` | object | No | Conversation routing (mode, heartbeat, perChannel overrides) |
 | `channels` | object | No | Channel configs (same schema as top-level `channels:`). At least one agent must have channels. |
 | `features` | object | No | Per-agent features (cron, heartbeat, memfs, maxToolCalls) |
 | `polling` | object | No | Per-agent polling config (Gmail, etc.) |
 | `integrations` | object | No | Per-agent integrations (Google, etc.) |
+
+### Conversation Routing
+
+Conversation routing controls which incoming messages share a Letta conversation.
+
+```yaml
+conversations:
+  mode: shared            # shared (default) or per-channel
+  heartbeat: last-active  # per-channel mode, or shared mode with perChannel overrides
+  perChannel:
+    - bluesky             # always separate, even in shared mode
+```
+
+- **mode: shared** (default) keeps one shared conversation across all channels.
+- **mode: per-channel** creates an independent conversation per channel.
+- **perChannel** lets you keep most channels shared while carving out specific channels to run independently.
+- **heartbeat**: `dedicated`, `last-active`, or a specific channel name. Applies in per-channel mode and in shared mode with perChannel overrides.
 
 ### How it works
 

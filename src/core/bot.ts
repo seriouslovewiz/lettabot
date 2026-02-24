@@ -206,6 +206,49 @@ export function isResponseDeliverySuppressed(msg: Pick<InboundMessage, 'isListen
   return msg.isListeningMode === true;
 }
 
+/**
+ * Pure function: resolve the conversation key for a channel message.
+ * Returns the channel id in per-channel mode or when the channel is in overrides.
+ * Returns 'shared' otherwise.
+ */
+export function resolveConversationKey(
+  channel: string,
+  conversationMode: string | undefined,
+  conversationOverrides: Set<string>,
+): string {
+  const normalized = channel.toLowerCase();
+  if (conversationMode === 'per-channel') return normalized;
+  if (conversationOverrides.has(normalized)) return normalized;
+  return 'shared';
+}
+
+/**
+ * Pure function: resolve the conversation key for heartbeat/sendToAgent.
+ * In per-channel mode, respects heartbeatConversation setting.
+ * In shared mode with overrides, respects override channels when using last-active.
+ */
+export function resolveHeartbeatConversationKey(
+  conversationMode: string | undefined,
+  heartbeatConversation: string | undefined,
+  conversationOverrides: Set<string>,
+  lastActiveChannel?: string,
+): string {
+  const hb = heartbeatConversation || 'last-active';
+
+  if (conversationMode === 'per-channel') {
+    if (hb === 'dedicated') return 'heartbeat';
+    if (hb === 'last-active') return lastActiveChannel ?? 'shared';
+    return hb;
+  }
+
+  // shared mode — if last-active and overrides exist, respect the override channel
+  if (hb === 'last-active' && conversationOverrides.size > 0 && lastActiveChannel) {
+    return resolveConversationKey(lastActiveChannel, conversationMode, conversationOverrides);
+  }
+
+  return 'shared';
+}
+
 export class LettaBot implements AgentSession {
   private store: Store;
   private config: BotConfig;
@@ -230,6 +273,7 @@ export class LettaBot implements AgentSession {
   // channel (and optionally heartbeat) gets its own subprocess.
   private sessions: Map<string, Session> = new Map();
   private currentCanUseTool: CanUseToolCallback | undefined;
+  private conversationOverrides: Set<string> = new Set();
   // Stable callback wrapper so the Session options never change, but we can
   // swap out the per-message handler before each send().
   private readonly sessionCanUseTool: CanUseToolCallback = async (toolName, toolInput) => {
@@ -243,6 +287,9 @@ export class LettaBot implements AgentSession {
     this.config = config;
     mkdirSync(config.workingDir, { recursive: true });
     this.store = new Store('lettabot-agent.json', config.agentName);
+    if (config.conversationOverrides?.length) {
+      this.conversationOverrides = new Set(config.conversationOverrides.map((ch) => ch.toLowerCase()));
+    }
     log.info(`LettaBot initialized. Agent ID: ${this.store.agentId || '(new)'}`);
   }
 
@@ -725,27 +772,25 @@ export class LettaBot implements AgentSession {
 
   /**
    * Resolve the conversation key for a channel message.
-   * In shared mode returns "shared"; in per-channel mode returns the channel id.
+   * Returns 'shared' in shared mode (unless channel is in perChannel overrides).
+   * Returns channel id in per-channel mode or for override channels.
    */
   private resolveConversationKey(channel: string): string {
-    return this.config.conversationMode === 'per-channel' ? channel : 'shared';
+    return resolveConversationKey(channel, this.config.conversationMode, this.conversationOverrides);
   }
 
   /**
    * Resolve the conversation key for heartbeat/sendToAgent.
+   * Respects perChannel overrides when using last-active in shared mode.
    */
   private resolveHeartbeatConversationKey(): string {
-    if (this.config.conversationMode !== 'per-channel') return 'shared';
-
-    const hb = this.config.heartbeatConversation || 'last-active';
-    if (hb === 'dedicated') return 'heartbeat';
-    if (hb === 'last-active') {
-      // Use the last channel the user messaged on
-      const target = this.store.lastMessageTarget;
-      return target ? target.channel : 'shared';
-    }
-    // Explicit channel name (e.g., "telegram")
-    return hb;
+    const lastActiveChannel = this.store.lastMessageTarget?.channel;
+    return resolveHeartbeatConversationKey(
+      this.config.conversationMode,
+      this.config.heartbeatConversation,
+      this.conversationOverrides,
+      lastActiveChannel,
+    );
   }
 
   // =========================================================================
@@ -1029,8 +1074,8 @@ export class LettaBot implements AgentSession {
       }
     }
 
-    if (this.config.conversationMode === 'per-channel') {
-      const convKey = this.resolveConversationKey(effective.channel);
+    const convKey = this.resolveConversationKey(effective.channel);
+    if (convKey !== 'shared') {
       this.enqueueForKey(convKey, effective, adapter);
     } else {
       this.messageQueue.push({ msg: effective, adapter });
@@ -1224,10 +1269,9 @@ export class LettaBot implements AgentSession {
       return;
     }
 
-    if (this.config.conversationMode === 'per-channel') {
-      // Per-channel mode: messages on different channels can run in parallel.
-      // Only serialize within the same conversation key.
-      const convKey = this.resolveConversationKey(msg.channel);
+    const convKey = this.resolveConversationKey(msg.channel);
+    if (convKey !== 'shared') {
+      // Per-channel or override mode: messages on different keys can run in parallel.
       this.enqueueForKey(convKey, msg, adapter);
     } else {
       // Shared mode: single global queue (existing behavior)
@@ -1833,7 +1877,7 @@ export class LettaBot implements AgentSession {
   private async acquireLock(convKey: string): Promise<boolean> {
     if (convKey === 'heartbeat') return false; // No lock needed
 
-    if (this.config.conversationMode === 'per-channel') {
+    if (convKey !== 'shared') {
       while (this.processingKeys.has(convKey)) {
         await new Promise(resolve => setTimeout(resolve, 1000));
       }
@@ -1849,8 +1893,17 @@ export class LettaBot implements AgentSession {
 
   private releaseLock(convKey: string, acquired: boolean): void {
     if (!acquired) return;
-    if (this.config.conversationMode === 'per-channel') {
+    if (convKey !== 'shared') {
       this.processingKeys.delete(convKey);
+      // Heartbeats/sendToAgent may hold a channel key while user messages for
+      // that same key queue up. Kick the keyed worker after unlock so queued
+      // messages are not left waiting for another inbound message to arrive.
+      const queue = this.keyedQueues.get(convKey);
+      if (queue && queue.length > 0) {
+        this.processKeyedQueue(convKey).catch(err =>
+          log.error(`Fatal error in processKeyedQueue(${convKey}) after lock release:`, err)
+        );
+      }
     } else {
       this.processing = false;
       this.processQueue();
