@@ -259,18 +259,148 @@ export class LettaBot implements AgentSession {
     return `${this.config.displayName}: ${text}`;
   }
 
+  // ---- Tool call display ----
+
+  /**
+   * Pretty display config for known tools.
+   * `header`: bold verb shown to the user (e.g., "Searching")
+   * `argKeys`: ordered preference list of fields to extract from toolInput
+   *            or tool_result JSON as the detail line
+   * `format`: optional -- 'code' wraps the detail in backticks
+   */
+  private static readonly TOOL_DISPLAY_MAP: Record<string, {
+    header: string;
+    argKeys: string[];
+    format?: 'code';
+    /** For 'code' format: if the first argKey value exceeds this length,
+     *  fall back to the next argKey shown as plain text instead. */
+    adaptiveCodeThreshold?: number;
+    /** Dynamic header based on tool input. When provided, the return value
+     *  replaces `header` entirely and no argKey detail is appended. */
+    headerFn?: (input: Record<string, unknown>) => string;
+  }> = {
+    web_search:          { header: 'Searching',      argKeys: ['query'] },
+    fetch_webpage:       { header: 'Reading',         argKeys: ['url'] },
+    Bash:                { header: 'Running',          argKeys: ['command', 'description'], format: 'code', adaptiveCodeThreshold: 80 },
+    Read:                { header: 'Reading',          argKeys: ['file_path'] },
+    Edit:                { header: 'Editing',          argKeys: ['file_path'] },
+    Write:               { header: 'Writing',          argKeys: ['file_path'] },
+    Glob:                { header: 'Finding files',    argKeys: ['pattern'] },
+    Grep:                { header: 'Searching code',   argKeys: ['pattern'] },
+    Task:                { header: 'Delegating',       argKeys: ['description'] },
+    conversation_search: { header: 'Searching conversation history', argKeys: ['query'] },
+    archival_memory_search: { header: 'Searching archival memory', argKeys: ['query'] },
+    run_code:            { header: 'Running code',     argKeys: ['code'], format: 'code' },
+    note:                { header: 'Taking note',      argKeys: ['title', 'content'] },
+    manage_todo:         { header: 'Updating todos',   argKeys: [] },
+    TodoWrite:           { header: 'Updating todos',   argKeys: [] },
+    Skill:               {
+      header: 'Loading skill',
+      argKeys: ['skill'],
+      headerFn: (input) => {
+        const skill = input.skill as string | undefined;
+        const command = (input.command as string | undefined) || (input.args as string | undefined);
+        if (command === 'unload') return skill ? `Unloading ${skill}` : 'Unloading skill';
+        if (command === 'refresh') return 'Refreshing skills';
+        return skill ? `Loading ${skill}` : 'Loading skill';
+      },
+    },
+  };
+
   /**
    * Format a tool call for channel display.
-   * Shows tool name + abbreviated key parameters.
+   *
+   * Known tools get a pretty verb-based header (e.g., **Searching**).
+   * Unknown tools fall back to **Tool**\n<name> (<args>).
+   *
+   * When toolInput is empty (SDK streaming limitation -- the CLI only
+   * forwards the first chunk before args are accumulated), we fall back
+   * to extracting the detail from the tool_result content.
    */
-  private formatToolCallDisplay(streamMsg: StreamMsg): string {
+  private formatToolCallDisplay(streamMsg: StreamMsg, toolResult?: StreamMsg): string {
     const name = streamMsg.toolName || 'unknown';
-    const params = this.abbreviateToolInput(streamMsg);
-    return params ? `**Tool:** ${name} (${params})` : `**Tool:** ${name}`;
+    const display = LettaBot.TOOL_DISPLAY_MAP[name];
+
+    if (display) {
+      // --- Dynamic header path (e.g., Skill tool with load/unload/refresh modes) ---
+      if (display.headerFn) {
+        const input = (streamMsg.toolInput as Record<string, unknown> | undefined) ?? {};
+        return `**${display.headerFn(input)}**`;
+      }
+
+      // --- Custom display path ---
+      const detail = this.extractToolDetail(display.argKeys, streamMsg, toolResult);
+      if (detail) {
+        let formatted: string;
+        if (display.format === 'code' && display.adaptiveCodeThreshold) {
+          // Adaptive: short values get code format, long values fall back to
+          // the next argKey as plain text (e.g., Bash shows `command` for short
+          // commands, but the human-readable `description` for long ones).
+          if (detail.length <= display.adaptiveCodeThreshold) {
+            formatted = `\`${detail}\``;
+          } else {
+            const fallback = this.extractToolDetail(display.argKeys.slice(1), streamMsg, toolResult);
+            formatted = fallback || detail.slice(0, display.adaptiveCodeThreshold) + '...';
+          }
+        } else {
+          formatted = display.format === 'code' ? `\`${detail}\`` : detail;
+        }
+        return `**${display.header}**\n${formatted}`;
+      }
+      return `**${display.header}**`;
+    }
+
+    // --- Generic fallback for unknown tools ---
+    let params = this.abbreviateToolInput(streamMsg);
+    if (!params && toolResult?.content) {
+      params = this.extractInputFromToolResult(toolResult.content);
+    }
+    return params ? `**Tool**\n${name} (${params})` : `**Tool**\n${name}`;
+  }
+
+  /**
+   * Extract the first matching detail string from a tool call's input or
+   * the subsequent tool_result content (fallback for empty toolInput).
+   */
+  private extractToolDetail(
+    argKeys: string[],
+    streamMsg: StreamMsg,
+    toolResult?: StreamMsg,
+  ): string {
+    if (argKeys.length === 0) return '';
+
+    // 1. Try toolInput (primary -- when SDK provides args)
+    const input = streamMsg.toolInput as Record<string, unknown> | undefined;
+    if (input && typeof input === 'object') {
+      for (const key of argKeys) {
+        const val = input[key];
+        if (typeof val === 'string' && val.length > 0) {
+          return val.length > 120 ? val.slice(0, 117) + '...' : val;
+        }
+      }
+    }
+
+    // 2. Try tool_result content (fallback for empty toolInput)
+    if (toolResult?.content) {
+      try {
+        const parsed = JSON.parse(toolResult.content);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          for (const key of argKeys) {
+            const val = (parsed as Record<string, unknown>)[key];
+            if (typeof val === 'string' && val.length > 0) {
+              return val.length > 120 ? val.slice(0, 117) + '...' : val;
+            }
+          }
+        }
+      } catch { /* non-JSON result -- skip */ }
+    }
+
+    return '';
   }
 
   /**
    * Extract a brief parameter summary from a tool call's input.
+   * Used only by the generic fallback display path.
    */
   private abbreviateToolInput(streamMsg: StreamMsg): string {
     const input = streamMsg.toolInput as Record<string, unknown> | undefined;
@@ -292,16 +422,68 @@ export class LettaBot implements AgentSession {
   }
 
   /**
-   * Format reasoning text for channel display, respecting truncation config.
+   * Fallback: extract input parameters from a tool_result's content.
+   * Some tools echo their input in the result (e.g., web_search includes
+   * `query`). Used only by the generic fallback display path.
    */
-  private formatReasoningDisplay(text: string): string {
+  private extractInputFromToolResult(content: string): string {
+    try {
+      const parsed = JSON.parse(content);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return '';
+
+      const inputKeys = ['query', 'input', 'prompt', 'url', 'search_query', 'text'];
+      const parts: string[] = [];
+
+      for (const key of inputKeys) {
+        const val = (parsed as Record<string, unknown>)[key];
+        if (typeof val === 'string' && val.length > 0) {
+          const truncated = val.length > 80 ? val.slice(0, 77) + '...' : val;
+          parts.push(`${key}: ${truncated}`);
+          if (parts.length >= 2) break;
+        }
+      }
+
+      return parts.join(', ');
+    } catch {
+      return '';
+    }
+  }
+
+  /**
+   * Format reasoning text for channel display, respecting truncation config.
+   * Returns { text, parseMode? } -- Telegram gets HTML with <blockquote> to
+   * bypass telegramify-markdown (which adds unwanted spaces to blockquotes).
+   * Signal falls back to italic (no blockquote support).
+   * Discord/Slack use markdown blockquotes.
+   */
+  private formatReasoningDisplay(text: string, channelId?: string): { text: string; parseMode?: string } {
     const maxChars = this.config.display?.reasoningMaxChars ?? 0;
-    const truncated = maxChars > 0 && text.length > maxChars
-      ? text.slice(0, maxChars) + '...'
-      : text;
-    // Use italic for reasoning -- works across all channels including Signal
-    // (Signal only supports bold/italic/code, no blockquotes)
-    return `**Thinking**\n_${truncated}_`;
+    // Trim leading whitespace from each line -- the API often includes leading
+    // spaces in reasoning chunks that look wrong in channel output.
+    const cleaned = text.split('\n').map(line => line.trimStart()).join('\n').trim();
+    const truncated = maxChars > 0 && cleaned.length > maxChars
+      ? cleaned.slice(0, maxChars) + '...'
+      : cleaned;
+
+    if (channelId === 'signal') {
+      // Signal: no blockquote support, use italic
+      return { text: `**Thinking**\n_${truncated}_` };
+    }
+    if (channelId === 'telegram' || channelId === 'telegram-mtproto') {
+      // Telegram: use HTML blockquote to bypass telegramify-markdown spacing
+      const escaped = truncated
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+      return {
+        text: `<blockquote expandable><b>Thinking</b>\n${escaped}</blockquote>`,
+        parseMode: 'HTML',
+      };
+    }
+    // Discord, Slack, etc: markdown blockquote
+    const lines = truncated.split('\n');
+    const quoted = lines.map(line => `> ${line}`).join('\n');
+    return { text: `> **Thinking**\n${quoted}` };
   }
 
   // =========================================================================
@@ -1231,9 +1413,7 @@ export class LettaBot implements AgentSession {
       let lastErrorDetail: { message: string; stopReason: string; apiError?: Record<string, unknown> } | null = null;
       let retryInfo: { attempt: number; maxAttempts: number; reason: string } | null = null;
       let reasoningBuffer = '';
-      // Buffer the latest tool_call by ID so we display it once with full args
-      // (the SDK streams multiple tool_call messages per call -- first has empty input).
-      let pendingToolDisplay: { toolCallId: string; msg: any } | null = null;
+      // Tool call displays fire immediately on arrival (SDK now accumulates args).
       const msgTypeCounts: Record<string, number> = {};
 
       const parseAndHandleDirectives = async () => {
@@ -1312,8 +1492,8 @@ export class LettaBot implements AgentSession {
           if (isSemanticType && lastMsgType === 'reasoning' && streamMsg.type !== 'reasoning' && reasoningBuffer.trim()) {
             if (this.config.display?.showReasoning && !suppressDelivery) {
               try {
-                const text = this.formatReasoningDisplay(reasoningBuffer);
-                await adapter.sendMessage({ chatId: msg.chatId, text, threadId: msg.threadId });
+                const reasoning = this.formatReasoningDisplay(reasoningBuffer, adapter.id);
+                await adapter.sendMessage({ chatId: msg.chatId, text: reasoning.text, threadId: msg.threadId, parseMode: reasoning.parseMode });
                 // Note: display messages don't set sentAnyMessage -- they're informational,
                 // not a substitute for an assistant response. Error handling and retry must
                 // still fire even if reasoning was displayed.
@@ -1324,21 +1504,7 @@ export class LettaBot implements AgentSession {
             reasoningBuffer = '';
           }
 
-          // Flush pending tool call display when type changes away from tool_call.
-          // The SDK streams multiple tool_call messages per call (first has empty args),
-          // so we buffer and display the last one which has the complete input.
-          if (isSemanticType && pendingToolDisplay && streamMsg.type !== 'tool_call') {
-            if (this.config.display?.showToolCalls && !suppressDelivery) {
-              try {
-                const text = this.formatToolCallDisplay(pendingToolDisplay.msg);
-                await adapter.sendMessage({ chatId: msg.chatId, text, threadId: msg.threadId });
-                // Display messages don't set sentAnyMessage (see reasoning display comment).
-              } catch (err) {
-                console.warn('[Bot] Failed to send tool call display:', err instanceof Error ? err.message : err);
-              }
-            }
-            pendingToolDisplay = null;
-          }
+          // (Tool call displays fire immediately in the tool_call handler below.)
           
           // Tool loop detection
           const maxToolCalls = this.config.maxToolCalls ?? 100;
@@ -1356,9 +1522,15 @@ export class LettaBot implements AgentSession {
             const tcId = streamMsg.toolCallId?.slice(0, 12) || '?';
             log.info(`>>> TOOL CALL: ${tcName} (id: ${tcId})`);
             sawNonAssistantSinceLastUuid = true;
-            // Buffer the tool call -- the SDK streams multiple chunks per call
-            // (first has empty args). We display the last chunk when type changes.
-            pendingToolDisplay = { toolCallId: streamMsg.toolCallId || '', msg: streamMsg };
+            // Display tool call immediately (args are now populated by SDK accumulation fix)
+            if (this.config.display?.showToolCalls && !suppressDelivery) {
+              try {
+                const text = this.formatToolCallDisplay(streamMsg);
+                await adapter.sendMessage({ chatId: msg.chatId, text, threadId: msg.threadId });
+              } catch (err) {
+                console.warn('[Bot] Failed to send tool call display:', err instanceof Error ? err.message : err);
+              }
+            }
           } else if (streamMsg.type === 'tool_result') {
             log.info(`<<< TOOL RESULT: error=${streamMsg.isError}, len=${(streamMsg as any).content?.length || 0}`);
             sawNonAssistantSinceLastUuid = true;
